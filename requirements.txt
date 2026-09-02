@@ -1,0 +1,12 @@
+streamlit
+langchain==0.2.16
+langchain-core==0.2.43
+langchain-community==0.2.19
+langchain-chroma
+langchain-groq
+langchain-huggingface
+sentence-transformers
+pymupdf
+rank-bm25
+python-dotenv
+pandas
