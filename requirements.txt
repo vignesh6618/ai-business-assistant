@@ -1,7 +1,7 @@
 streamlit
-langchain==0.2.16
-langchain-core==0.2.43
-langchain-community==0.2.19
+langchain>=0.2.17,<0.3.0
+langchain-core>=0.2.43,<0.3.0
+langchain-community>=0.2.17,<0.3.0
 langchain-chroma
 langchain-groq
 langchain-huggingface
