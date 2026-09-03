@@ -5,8 +5,8 @@
 # search over them.
 #
 # The three steps below map directly to the three functions:
-#   1. load_document       -> read the file into plain text pages
-#   2. split_into_chunks    -> break long text into small overlapping pieces
+#   1. load_document          -> read the file into plain text pages
+#   2. split_into_chunks       -> break long text into small overlapping pieces
 #   3. create_and_store_embeddings -> turn chunks into vectors and save them
 
 import gc
@@ -15,6 +15,7 @@ import shutil
 import time
 from pathlib import Path
 
+import chromadb
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -218,10 +219,14 @@ def create_and_store_embeddings(chunks, persist_directory=None):
     print("Generating embeddings and saving to the vector store...")
     embedding_model = HuggingFaceEmbeddings(model_name=config.EMBEDDING_MODEL_NAME)
 
+    # Initialize client explicitly with a string path to prevent tenant lookup issues
+    client = chromadb.PersistentClient(path=str(persist_directory))
+
     vector_store = Chroma.from_documents(
         documents=chunks,
         embedding=embedding_model,
-        persist_directory=persist_directory,
+        client=client,
+        collection_name="business_docs",
     )
     print(f"Saved {len(chunks)} chunks to '{persist_directory}'.")
     return vector_store
