@@ -71,7 +71,7 @@ st.markdown(
     }
     .method-pill {
         display: inline-block;
-        background-color: rgba(16,185,129,0.15);
+        background-color: rgba(160,185,129,0.15);
         color: #34D399;
         font-size: 0.72rem;
         padding: 2px 10px;
@@ -86,6 +86,7 @@ st.markdown(
         padding: 3px 12px;
         border-radius: 999px;
         margin-right: 8px;
+        margin-bottom: 6px;
     }
     .status-dot {
         display: inline-block;
@@ -151,6 +152,10 @@ if "viewer_page" not in st.session_state:
 if "pending_question" not in st.session_state:
     st.session_state.pending_question = None
 
+# Tracks uploader version to force-clear mobile browser input state
+if "uploader_counter" not in st.session_state:
+    st.session_state.uploader_counter = 0
+
 # Startup configuration check
 try:
     config.check_config()
@@ -162,10 +167,12 @@ except ValueError as error:
 def render_pdf_page(pdf_bytes: bytes, page_index: int):
     """Rasterizes a single page of the uploaded PDF to PNG bytes for preview."""
     document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-    page = document.load_page(page_index)
+    # Clamp requested page between 0 and total pages
+    total_pages = document.page_count
+    safe_page = max(0, min(page_index, total_pages - 1))
+    page = document.load_page(safe_page)
     pixmap = page.get_pixmap(dpi=140)
     image_bytes = pixmap.tobytes("png")
-    total_pages = document.page_count
     document.close()
     return image_bytes, total_pages
 
@@ -233,28 +240,42 @@ with chat_col:
     with upload_col:
         with st.popover("➕", use_container_width=True):
             st.markdown("**Add document to index**")
-            uploaded_file = st.file_uploader("Upload PDF", type=["pdf"], label_visibility="collapsed", key="pdf_file")
+            
+            # Dynamic key prevents mobile file-lock bug
+            uploader_key = f"pdf_file_{st.session_state.uploader_counter}"
+            uploaded_file = st.file_uploader(
+                "Upload PDF", 
+                type=["pdf"], 
+                label_visibility="collapsed", 
+                key=uploader_key
+            )
+            
             if uploaded_file is not None:
                 if st.button("Index File", use_container_width=True):
                     pdf_bytes = uploaded_file.getvalue()
 
                     with st.status("Indexing document...", expanded=True) as status:
                         st.write("📄 Extracting text...")
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                            tmp.write(pdf_bytes)
-                            tmp_path = tmp.name
+                        tmp_path = None
+                        try:
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                                tmp.write(pdf_bytes)
+                                tmp_path = tmp.name
 
-                        st.write("✂️ Splitting into overlapping chunks...")
-                        st.write("🧠 Generating embeddings & building BM25 index...")
-                        pipeline.process_uploaded_file(tmp_path)
-                        os.remove(tmp_path)
+                            st.write("✂️ Splitting into overlapping chunks...")
+                            st.write("🧠 Generating embeddings & building BM25 index...")
+                            pipeline.process_uploaded_file(tmp_path)
+                            status.update(label="Document indexed successfully!", state="complete", expanded=False)
+                        finally:
+                            if tmp_path and os.path.exists(tmp_path):
+                                os.remove(tmp_path)
 
-                        status.update(label="Document indexed successfully!", state="complete", expanded=False)
-
+                    # Update state and increment counter to reset file uploader cleanly on mobile/PC
                     st.session_state.document_ready = True
                     st.session_state.pdf_bytes = pdf_bytes
                     st.session_state.pdf_name = uploaded_file.name
                     st.session_state.viewer_page = 0
+                    st.session_state.uploader_counter += 1
                     st.session_state.chat_history = [
                         {
                             "role": "assistant",
@@ -297,7 +318,7 @@ with viewer_col:
 
             prev_col, _, next_col = st.columns([1, 2, 1])
             with prev_col:
-                if st.button("← Prev", disabled=st.session_state.viewer_page == 0, use_container_width=True):
+                if st.button("← Prev", disabled=st.session_state.viewer_page <= 0, use_container_width=True):
                     st.session_state.viewer_page -= 1
                     st.rerun()
             with next_col:
