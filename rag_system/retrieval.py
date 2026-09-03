@@ -5,6 +5,7 @@
 
 import re
 
+import chromadb
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -18,8 +19,10 @@ from rag_system import config
 COURSE_CODE_PATTERN = re.compile(r"\d{2}[A-Z]{2}\d{3}[A-Z]{2}")
 UNIT_ROMAN_PATTERN = re.compile(r"UNIT\s*-?\s*([IVX]+)\b", re.IGNORECASE)
 UNIT_ARABIC_PATTERN = re.compile(r"UNIT\s*-?\s*(\d{1,2})\b", re.IGNORECASE)
-ARABIC_TO_ROMAN_UNIT = {"1": "I", "2": "II", "3": "III", "4": "IV", "5": "V",
-                         "6": "VI", "7": "VII", "8": "VIII", "9": "IX", "10": "X"}
+ARABIC_TO_ROMAN_UNIT = {
+    "1": "I", "2": "II", "3": "III", "4": "IV", "5": "V",
+    "6": "VI", "7": "VII", "8": "VIII", "9": "IX", "10": "X"
+}
 
 # Common connector words that shouldn't count as "distinguishing" when
 # matching a course name against a question.
@@ -39,9 +42,13 @@ def load_vector_store(persist_directory=None):
     persist_directory = persist_directory or config.VECTOR_STORE_DIRECTORY
     embedding_model = HuggingFaceEmbeddings(model_name=config.EMBEDDING_MODEL_NAME)
 
+    # Initialize client explicitly with a string path to prevent tenant lookup issues
+    client = chromadb.PersistentClient(path=str(persist_directory))
+
     vector_store = Chroma(
-        persist_directory=persist_directory,
+        client=client,
         embedding_function=embedding_model,
+        collection_name="business_docs",
     )
     return vector_store
 
@@ -74,29 +81,6 @@ def _build_bm25_index(vector_store):
     tokenized_corpus = [_tokenize(doc) for doc in documents]
     bm25 = BM25Okapi(tokenized_corpus)
     return bm25, documents, metadatas
-
-
-def _reciprocal_rank_fusion(ranked_lists: list, top_k: int) -> list:
-    """
-    Combines several ranked lists of chunk texts into one ranking, using
-    Reciprocal Rank Fusion: each chunk's score is the sum of 1/(RRF_K +
-    rank) across every list it appears in.
-
-    Why this works well: a chunk that shows up in BOTH the semantic
-    search results AND the keyword search results gets points from both,
-    so it naturally rises to the top -- without needing to tune how much
-    to "trust" each method relative to the other.
-
-    ranked_lists is a list of lists of chunk texts, each already sorted
-    best-first. Returns the top_k chunk texts by fused score.
-    """
-    scores = {}
-    for ranked_list in ranked_lists:
-        for rank, chunk_text in enumerate(ranked_list, start=1):
-            scores[chunk_text] = scores.get(chunk_text, 0.0) + 1.0 / (config.RRF_K + rank)
-
-    ranked_texts = sorted(scores.keys(), key=lambda text: -scores[text])
-    return ranked_texts[:top_k]
 
 
 def _reciprocal_rank_fusion(ranked_lists: dict, top_k: int) -> list:
