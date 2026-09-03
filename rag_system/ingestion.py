@@ -3,11 +3,6 @@
 # Job of this file: take a raw file (PDF, for now) and turn it into small,
 # embedded chunks stored in a vector database, so retrieval.py can later
 # search over them.
-#
-# The three steps below map directly to the three functions:
-#   1. load_document          -> read the file into plain text pages
-#   2. split_into_chunks       -> break long text into small overlapping pieces
-#   3. create_and_store_embeddings -> turn chunks into vectors and save them
 
 import functools
 import gc
@@ -16,7 +11,7 @@ from pathlib import Path
 
 import chromadb
 import torch
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader, PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
@@ -44,15 +39,37 @@ def get_embedding_model():
 
 def load_document(file_path: str):
     """
-    Loads a PDF file and returns a list of LangChain Document objects,
-    one per page. We use PyPDFLoader because it's simple and works well
-    for text-based PDFs (the most common case for business reports).
+    Loads a PDF file and returns a list of LangChain Document objects, one per page.
+    Attempts extraction with PyPDFLoader first, then falls back to PyMuPDFLoader
+    if no text is found (common with resumes created in design tools).
     """
     print(f"Loading document: {file_path}")
     loader = PyPDFLoader(file_path)
     pages = loader.load()
-    print(f"Loaded {len(pages)} pages.")
-    return pages
+
+    # Filter out empty or whitespace-only pages
+    non_empty_pages = [p for p in pages if p.page_content and p.page_content.strip()]
+
+    # If PyPDFLoader found no selectable text, try PyMuPDFLoader
+    if not non_empty_pages:
+        print("PyPDFLoader extracted no text. Trying PyMuPDFLoader fallback...")
+        try:
+            fallback_loader = PyMuPDFLoader(file_path)
+            pages = fallback_loader.load()
+            non_empty_pages = [p for p in pages if p.page_content and p.page_content.strip()]
+        except Exception as e:
+            print(f"PyMuPDFLoader fallback failed: {e}")
+
+    # If still empty, the document is an image/flat scan with no digital text
+    if not non_empty_pages:
+        raise ValueError(
+            "Could not extract any readable text from this PDF. "
+            "It appears to be a scanned image or contains non-selectable text. "
+            "Please upload a text-based document."
+        )
+
+    print(f"Loaded {len(non_empty_pages)} pages with text.")
+    return non_empty_pages
 
 
 def split_into_chunks(pages, chunk_size=None, chunk_overlap=None):
@@ -136,11 +153,10 @@ def create_and_store_embeddings(chunks, persist_directory=None):
     """
     Converts each text chunk into a numeric vector (an "embedding") and
     saves those vectors to a local Chroma vector database on disk.
-
-    Uses Chroma's client.delete_collection() instead of deleting folders from disk.
-    This prevents SQLite file-lock crashes and tenant errors when uploading
-    consecutive files without leaving or restarting the app.
     """
+    if not chunks:
+        raise ValueError("Cannot index an empty document. No text chunks were created.")
+
     persist_directory = persist_directory or config.VECTOR_STORE_DIRECTORY
 
     print("Generating embeddings and saving to the vector store...")
@@ -149,12 +165,11 @@ def create_and_store_embeddings(chunks, persist_directory=None):
     # 1. Initialize persistent client explicitly
     client = chromadb.PersistentClient(path=str(persist_directory))
 
-    # 2. Reset collection cleanly without deleting disk files or breaking active connections
+    # 2. Reset collection cleanly without deleting disk files
     try:
         client.delete_collection("business_docs")
         print("Cleared previous collection from database.")
     except Exception:
-        # First-time upload: collection doesn't exist yet, safe to pass
         pass
 
     # 3. Store new embeddings under the same collection name
@@ -176,11 +191,16 @@ def create_and_store_embeddings(chunks, persist_directory=None):
 
 def ingest_document(file_path: str):
     """
-    Convenience function that runs all three ingestion steps in order.
-    This is the single function the rest of the app calls when a new
-    document is uploaded.
+    Runs all ingestion steps in order.
     """
     pages = load_document(file_path)
     chunks = split_into_chunks(pages)
+
+    if not chunks:
+        raise ValueError(
+            "Document was parsed, but no readable text chunks could be formed. "
+            "Please ensure the PDF contains selectable digital text."
+        )
+
     vector_store = create_and_store_embeddings(chunks)
     return vector_store
