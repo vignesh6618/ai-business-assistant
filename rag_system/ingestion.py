@@ -9,10 +9,13 @@
 #   2. split_into_chunks       -> break long text into small overlapping pieces
 #   3. create_and_store_embeddings -> turn chunks into vectors and save them
 
+import functools
+import gc
 import re
 from pathlib import Path
 
 import chromadb
+import torch
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -28,6 +31,15 @@ COURSE_HEADER_PATTERN = re.compile(
 
 # Matches "UNIT - II", "UNIT-II", "UNIT II", etc.
 UNIT_HEADING_PATTERN = re.compile(r"UNIT\s*-?\s*([IVX]+)\b")
+
+
+@functools.lru_cache(maxsize=1)
+def get_embedding_model():
+    """
+    Caches the PyTorch embedding model in memory so it is only loaded once.
+    Prevents running out of memory (OOM crashes) during repeated uploads.
+    """
+    return HuggingFaceEmbeddings(model_name=config.EMBEDDING_MODEL_NAME)
 
 
 def load_document(file_path: str):
@@ -48,23 +60,6 @@ def split_into_chunks(pages, chunk_size=None, chunk_overlap=None):
     Splits pages of text into smaller overlapping chunks, and -- for
     syllabus-style documents -- tags each chunk with which course and
     unit it belongs to.
-
-    Why the tagging step exists: a course header like "22CS502PC:
-    COMPUTER NETWORKS" often appears only ONCE on a page, in the very
-    first chunk of that page. Once the page is split into several
-    chunks, later chunks lose that identifying text entirely. Two
-    different courses covering near-identical material (e.g. a required
-    course and an elective that teach the same topic) then become
-    indistinguishable to semantic search, because the actual content is
-    nearly the same -- the course code is the ONLY thing that tells them
-    apart. Prepending "[Course: ... | UNIT-...]" to every chunk keeps
-    that identity attached no matter where a chunk boundary falls, and
-    storing it as metadata lets retrieval.py filter by course/unit
-    directly instead of relying purely on similarity search.
-
-    If the document doesn't look like a syllabus at all (no course-code
-    pattern found anywhere), chunks are returned completely unchanged --
-    this only activates for documents that actually have that structure.
     """
     chunk_size = chunk_size or config.CHUNK_SIZE
     chunk_overlap = chunk_overlap or config.CHUNK_OVERLAP
@@ -88,21 +83,6 @@ def split_into_chunks(pages, chunk_size=None, chunk_overlap=None):
 def _split_and_tag_by_course_and_unit(pages, chunk_size, chunk_overlap):
     """
     Does the actual chunking + tagging for syllabus-style documents.
-
-    The core idea: find WHERE each course/unit heading appears (as a
-    character position) within each page's raw text, then use those
-    positions like a timeline to figure out which course/unit was "in
-    effect" at each chunk's location -- rather than just scanning each
-    chunk's own text in isolation, which breaks as soon as a chunk
-    happens to fall between two headings.
-
-    Course headers use the chunk's END position (a course transition
-    should immediately relabel the chunk it appears in). Unit headings
-    use the chunk's START position, since units are denser on a page and
-    a heading near a chunk's tail usually belongs more to the NEXT
-    chunk -- retrieval.py's text-match fallback catches any chunk this
-    under-tags, by checking the chunk's own text for the unit heading
-    directly, not just its metadata tag.
     """
     current_course_code, current_course_name = None, None
     tagged_chunks = []
@@ -164,12 +144,12 @@ def create_and_store_embeddings(chunks, persist_directory=None):
     persist_directory = persist_directory or config.VECTOR_STORE_DIRECTORY
 
     print("Generating embeddings and saving to the vector store...")
-    embedding_model = HuggingFaceEmbeddings(model_name=config.EMBEDDING_MODEL_NAME)
+    embedding_model = get_embedding_model()
 
     # 1. Initialize persistent client explicitly
     client = chromadb.PersistentClient(path=str(persist_directory))
 
-    # 2. Reset collection cleanly without deleting disk files or breaking active SQLite connections
+    # 2. Reset collection cleanly without deleting disk files or breaking active connections
     try:
         client.delete_collection("business_docs")
         print("Cleared previous collection from database.")
@@ -185,6 +165,12 @@ def create_and_store_embeddings(chunks, persist_directory=None):
         collection_name="business_docs",
     )
     print(f"Saved {len(chunks)} chunks to '{persist_directory}'.")
+
+    # Clean up garbage and memory buffers immediately
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return vector_store
 
 
