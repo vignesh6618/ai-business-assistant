@@ -9,10 +9,7 @@
 #   2. split_into_chunks       -> break long text into small overlapping pieces
 #   3. create_and_store_embeddings -> turn chunks into vectors and save them
 
-import gc
 import re
-import shutil
-import time
 from pathlib import Path
 
 import chromadb
@@ -31,52 +28,6 @@ COURSE_HEADER_PATTERN = re.compile(
 
 # Matches "UNIT - II", "UNIT-II", "UNIT II", etc.
 UNIT_HEADING_PATTERN = re.compile(r"UNIT\s*-?\s*([IVX]+)\b")
-
-
-def clear_vector_store(persist_directory=None):
-    """
-    Deletes the existing vector store folder from disk, if it exists.
-
-    Why we need this: Chroma.from_documents() ADDS to whatever is already
-    saved at persist_directory instead of replacing it. Without this step,
-    uploading a second document doesn't start fresh -- it silently mixes
-    the new document's chunks in with every document uploaded before it,
-    and a question can end up answered using the wrong document's data.
-
-    Why the retry loop: on Windows, a file can't be deleted while anything
-    still has it open -- including a Chroma client object left over from
-    an earlier question in this same app session. gc.collect() encourages
-    Python to release any such lingering references, and the short retries
-    give Windows a moment to actually free the file lock. This isn't
-    needed on Mac/Linux (they allow deleting open files), but it's a
-    no-op there, so it's safe to always include.
-    """
-    persist_directory = persist_directory or config.VECTOR_STORE_DIRECTORY
-    path = Path(persist_directory)
-
-    if not path.exists():
-        return
-
-    print(f"Clearing previous vector store at '{persist_directory}'...")
-
-    # Release any Chroma/SQLite objects still sitting in memory before we
-    # try to delete the files they might be holding open.
-    gc.collect()
-
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            shutil.rmtree(path)
-            return
-        except PermissionError:
-            if attempt == max_attempts:
-                raise RuntimeError(
-                    f"Could not clear '{persist_directory}' -- a previous process "
-                    "may still have it open. Close any other running instance of "
-                    "this app and try again."
-                )
-            print(f"  File still in use, retrying ({attempt}/{max_attempts})...")
-            time.sleep(0.5)
 
 
 def load_document(file_path: str):
@@ -206,22 +157,27 @@ def create_and_store_embeddings(chunks, persist_directory=None):
     Converts each text chunk into a numeric vector (an "embedding") and
     saves those vectors to a local Chroma vector database on disk.
 
-    We use a local embedding model (all-MiniLM-L6-v2) instead of a paid API
-    for this step, since embeddings need to run once per chunk and doing
-    that locally is free and fast enough for this project's scale.
+    Uses Chroma's client.delete_collection() instead of deleting folders from disk.
+    This prevents SQLite file-lock crashes and tenant errors when uploading
+    consecutive files without leaving or restarting the app.
     """
     persist_directory = persist_directory or config.VECTOR_STORE_DIRECTORY
-
-    # Start fresh: without this, a second upload would mix its chunks in
-    # with whatever was indexed before, instead of replacing it.
-    clear_vector_store(persist_directory)
 
     print("Generating embeddings and saving to the vector store...")
     embedding_model = HuggingFaceEmbeddings(model_name=config.EMBEDDING_MODEL_NAME)
 
-    # Initialize client explicitly with a string path to prevent tenant lookup issues
+    # 1. Initialize persistent client explicitly
     client = chromadb.PersistentClient(path=str(persist_directory))
 
+    # 2. Reset collection cleanly without deleting disk files or breaking active SQLite connections
+    try:
+        client.delete_collection("business_docs")
+        print("Cleared previous collection from database.")
+    except Exception:
+        # First-time upload: collection doesn't exist yet, safe to pass
+        pass
+
+    # 3. Store new embeddings under the same collection name
     vector_store = Chroma.from_documents(
         documents=chunks,
         embedding=embedding_model,
